@@ -2,6 +2,7 @@
 *.lnk
 *.uaem
 .DS_Store
+Amiga/
 AmigaRobots
 PETRobots
 ArcadeRobots
