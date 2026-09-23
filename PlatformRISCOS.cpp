@@ -4,8 +4,9 @@
  * Displays the game in a 640x400 Wimp window, scaled 2x from a 320x200
  * 8-bit chunky buffer using OS_SpriteOp PutSpriteScaled (SWI reason 52).
  * Keys are polled with OS_Byte 121 (single-key test) using internal key
- * numbers. Sound effects are played through OS_Sound; MOD music is not
- * played on RISC OS.
+ * numbers. Sound effects are played through OS_Sound; music is played
+ * through MODPlay, ticked once per 50 Hz frame and steered onto the
+ * RISC OS voices with Sound_Control.
  *
  * Files are read with fopen() using '.' directory separators (RISC OS
  * convention). The application must be run with its current directory
@@ -20,6 +21,8 @@
 
 #include "Palette.h"
 #include "PlatformRISCOS.h"
+
+#include "modplay.h"
 
 #define SCREEN_WIDTH 320
 #define SCREEN_HEIGHT 200
@@ -286,6 +289,12 @@ PlatformRISCOS::PlatformRISCOS() :
     cursorShape_(ShapeUse),
     loadedModule(ModuleSoundFX),
     audioInitialized_(false),
+    modStatus_(0),
+    musicBuffer_(0),
+    musicBufferSize_(0),
+    musicLen_(0),
+    modActive_(false),
+    modPaused_(false),
     shakeStep_(0),
     shakeOffsetX_(0),
     fadeIntensity_(15),
@@ -451,6 +460,10 @@ PlatformRISCOS::~PlatformRISCOS()
     // Stop audio
     stopModule();
     cleanupAudio();
+
+    // Free MOD music buffer
+    free(musicBuffer_);
+    musicBuffer_ = 0;
 
     // Free chunky tile data
     for (int i = 0; i < NUM_TILES; i++) {
@@ -726,6 +739,9 @@ void PlatformRISCOS::renderFrame(bool waitForNextFrame)
     if (interrupt_) {
         interrupt_();
     }
+
+    // Drive the MOD music player once per frame (50 Hz)
+    audioTick();
 
     frameCount_++;
 }
@@ -1556,23 +1572,173 @@ void PlatformRISCOS::stopNote()
 {
 }
 
+// ============================================================
+// MOD music via MODPlay (thirdparty/modplay.c)
+// ============================================================
+// The game's modules ship "packed" after the standard 1084-byte MOD
+// header: the magic at offset 1080 is !PM! instead of M.K. and the
+// sample data is delta coded. Both are undone in place here, matching
+// the Amiga port's undeltaSamples(). Music is then ticked once per
+// 50 Hz frame from renderFrame() and the resulting per-channel Paula
+// notes are steered onto the RISC OS Sound_Control voices 1-4.
+
+// Index order matches MorphOS: (module - 1), SoundFX maps to index 7.
+//  0 InGame1  1 Win  2 Lose  3 InGame2  4 InGame3
+//  5 InGame4  6 Intro  7 SoundFX
+// (MODULE_PATHS defined above with the other asset paths.)
+
+#define MUSIC_BUFFER_SIZE 200000
+#define SAMPLE_RATE 22050
+#define Sound_Control 0x40189
+
+void PlatformRISCOS::undeltaSamples(uint8_t* module, uint32_t moduleSize)
+{
+    uint8_t numPatterns = 0;
+    for (int i = 0; i < module[950]; i++) {
+        uint8_t p = module[952 + i];
+        if (p > numPatterns) numPatterns = p;
+    }
+    numPatterns++;
+
+    int8_t* samplesStart = (int8_t*)(module + 1084 + (numPatterns << 10));
+    int8_t* samplesEnd = (int8_t*)(module + moduleSize);
+
+    int8_t sample = 0;
+    for (int8_t* data = samplesStart; data < samplesEnd; data++) {
+        sample += *data;
+        *data = sample;
+    }
+}
+
+// Convert a MODPlay Paula sample period (16.16, relative to paularate
+// at SAMPLE_RATE) into a RISC OS Sound_Control octave/fraction pitch.
+// paularate = (3546895 / SAMPLE_RATE) << 16, so the original ProTracker
+// note period is paularate / (period / 65536). Integer log2 only.
+static int log2scale(long value)   // round(log2(value) * 4096), integer
+{
+    int whole = 0;
+    while (value >= 2) { value >>= 1; whole += 4096; }
+
+    // fractional bits: value in [1,2); repeatedly square toward 2.
+    int frac = 0;
+    long m = value << 12;          // 1.0 fixed to <<12 -> 4096
+    for (int bit = 0; bit < 12; bit++) {
+        m = (m * m) >> 12;
+        if (m >= 8192) {
+            m >>= 1;
+            frac |= 1 << (11 - bit);
+        }
+    }
+    return whole + frac;
+}
+
+static int periodToPitch(int32_t period)
+{
+    if (period <= 0) return 0;
+
+    long long rawLL = (long long)10541824 * 65536 / period;
+    if (rawLL <= 32) rawLL = 32;
+    if (rawLL > 1712) rawLL = 1712;
+    long raw = (long)rawLL;
+
+    // C-1 sits on octave 6: pitch = 6 + log2(428 / raw) in fracs.
+    int exp12 = log2scale(428) - log2scale(raw);   // log2(428) - log2(raw)
+    int pitch = (6 << 12) + exp12;
+    if (pitch < 0) pitch = 0;
+    if (pitch > 0x7fff) pitch = 0x7fff;
+    return pitch;
+}
+
+static void setVoice(int voice, int amplitude, int pitch, bool gateOn)
+{
+    _kernel_swi_regs in, out;
+    in.r[0] = voice;                       // Sound_Control voice 1..8
+    in.r[1] = (gateOn ? 0x100 : 0) | 0x80 | (amplitude & 0x7f);
+    in.r[2] = pitch & 0x7fff;
+    in.r[3] = 20;                          // duration: 100 centiseconds
+    _kernel_swi(Sound_Control, &in, &out);
+}
+
+void PlatformRISCOS::audioTick()
+{
+    if (!modStatus_ || !modActive_ || modPaused_) return;
+
+    ModPlayerStatus_t* status = (ModPlayerStatus_t*)modStatus_;
+    ProcessMOD();
+
+    for (int c = 0; c < 4; c++) {
+        const PaulaChannel_t* paula = &status->ch[c].samplegen;
+        int voice = c + 1;
+
+        if (!paula->sample || paula->period == 0) {
+            setVoice(voice, 0, 0, false);   // note off
+            continue;
+        }
+
+        int amplitude = paula->volume * 2;  // 0..64 -> 0..128
+        if (amplitude > 127) amplitude = 127;
+
+        setVoice(voice, amplitude, periodToPitch(paula->period), true);
+    }
+}
+
 void PlatformRISCOS::loadModule(Module module)
 {
+    // MorphOS-style index mapping (see MODULE_PATHS comment)
+    int idx = (module == ModuleSoundFX) ? 7 : ((int)module - 1);
+    if (idx < 0 || idx >= 8) return;
+
+    if (module == loadedModule && musicBuffer_ && musicLen_ > 0) return;
+
+    if (!musicBuffer_) {
+        musicBuffer_ = (uint8_t*)malloc(MUSIC_BUFFER_SIZE);
+    }
+    if (!musicBuffer_) return;
+
+    musicLen_ = loadFile(MODULE_PATHS[idx], musicBuffer_, MUSIC_BUFFER_SIZE);
+    if (musicLen_ == 0) {
+        loadedModule = module;
+        return;
+    }
+
+    // Unpack the !PM! modules in place (delta-coded samples).
+    if (musicLen_ >= 1084 && memcmp(musicBuffer_ + 1080, "!PM!", 4) == 0) {
+        memcpy(musicBuffer_ + 1080, "M.K.", 4);
+        undeltaSamples(musicBuffer_, musicLen_);
+    }
+
     loadedModule = module;
 }
 
 void PlatformRISCOS::playModule(Module module)
 {
-    // MOD music is not played on RISC OS.
-    loadedModule = module;
+    loadModule(module);
+    stopModule();
+
+    if (module != loadedModule || !musicBuffer_ || musicLen_ == 0) return;
+
+    modStatus_ = InitMOD(musicBuffer_, SAMPLE_RATE);
+    if (!modStatus_) return;
+
+    modActive_ = true;
+    modPaused_ = false;
 }
 
 void PlatformRISCOS::pauseModule()
 {
+    modPaused_ = true;
+    for (int c = 0; c < 4; c++) {
+        setVoice(c + 1, 0, 0, false);
+    }
 }
 
 void PlatformRISCOS::stopModule()
 {
+    modActive_ = false;
+    modPaused_ = false;
+    for (int c = 0; c < 4; c++) {
+        setVoice(c + 1, 0, 0, false);
+    }
 }
 
 void PlatformRISCOS::playSample(uint8_t sample)

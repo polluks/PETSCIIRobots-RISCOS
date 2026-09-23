@@ -142,9 +142,19 @@ private:
     CursorShape cursorShape_;
     uint8_t cursorData[28 * 32];
 
-    // Audio state (SFX via OS_Sound; modules not played)
+    // Audio state (SFX via OS_Sound; music via MODPlay)
     Module loadedModule;
     bool audioInitialized_;
+
+    // MODPlay music
+    void audioTick();
+    static void undeltaSamples(uint8_t* module, uint32_t moduleSize);
+    void* modStatus_;        // ModPlayerStatus_t* (kept opaque)
+    uint8_t* musicBuffer_;
+    uint32_t musicBufferSize_;
+    uint32_t musicLen_;
+    bool modActive_;
+    bool modPaused_;
 
     // Shake
     uint8_t shakeStep_;
