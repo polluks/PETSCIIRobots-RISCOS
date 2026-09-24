@@ -1,4 +1,6 @@
 *.o
+__pycache__/
+tools/out/
 *.lnk
 *.uaem
 .DS_Store

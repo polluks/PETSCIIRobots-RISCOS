@@ -170,7 +170,7 @@ void TOGGLE_MUSIC();
 void START_IN_GAME_MUSIC();
 
 #ifdef PLATFORM_MODULE_BASED_AUDIO
-extern Platform::Module LEVEL_MUSIC[];
+extern Module LEVEL_MUSIC[];
 #else
 extern uint8_t LEVEL_MUSIC[];
 #endif
@@ -243,7 +243,7 @@ void PLOT_TRANSPARENT_TILE(uint16_t destination, uint16_t x, uint16_t y);
 void REVERSE_TILE();
 #endif
 void CHECK_FOR_WINDOW_REDRAW();
-void DECWRITE(uint16_t destination, uint8_t color = 10);
+void DECWRITE(uint16_t destination, uint8_t color);
 
 void TILE_LOAD_ROUTINE();
 void MAP_LOAD_ROUTINE();
@@ -256,7 +256,7 @@ void DISPLAY_ENDGAME_SCREEN();
 
 extern char DIFF_LEVEL_WORDS[];
 
-void DECOMPRESS_SCREEN(uint8_t* source, uint8_t color = 10);
+void DECOMPRESS_SCREEN(uint8_t* source, uint8_t color);
 
 extern uint8_t RPT; // repeat value
 
@@ -529,6 +529,6 @@ extern uint8_t IN_GAME_MUSIC3[];
 #endif
 
 void convertToPETSCII(char* string);
-void writeToScreenMemory(address_t address, uint8_t value, uint8_t color = 10, uint8_t yOffset = 0);
+void writeToScreenMemory(address_t address, uint8_t value, uint8_t color, uint8_t yOffset);
 
 #endif
